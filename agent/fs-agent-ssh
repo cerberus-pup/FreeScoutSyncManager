@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# fs-agent-ssh - forced command for the manager's SSH key (see authorized_keys).
+# Only whitelisted fs-agent sub-commands can run; there is no shell access.
+set -euo pipefail
+CONF_ARGS=()
+if [[ ${1:-} == --conf ]]; then CONF_ARGS=(--conf "$2"); fi
+cmd=${SSH_ORIGINAL_COMMAND:-}
+# Plain words only: no quotes, shell metacharacters or escapes
+if ! [[ $cmd =~ ^[A-Za-z0-9._/=,:+@-]+([[:space:]]+[A-Za-z0-9._/=,:+@-]+)*$ ]]; then
+  echo "fs-agent: command rejected" >&2; exit 2
+fi
+read -r -a words <<<"$cmd"
+case ${words[0]} in
+  rsync|info|stats|dump-db|get-appkey|restore-db|maintenance|mode|finalize|health|modules|sso-keep-preview|ping|version)
+    exec sudo -n /usr/local/sbin/fs-agent "${CONF_ARGS[@]}" "${words[@]}" ;;
+  *) echo "fs-agent: command '${words[0]}' not allowed" >&2; exit 2 ;;
+esac

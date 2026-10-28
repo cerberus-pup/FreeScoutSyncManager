@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  fs-agent - privileged helper for FreeScout Sync Manager
+#  Runs as root via sudo, only ever invoked through fs-agent-ssh (a forced
+#  SSH command), so the manager's key can do these operations and nothing else.
+# =============================================================================
+set -Eeuo pipefail
+umask 077
+AGENT_VERSION="1.2.1"
+
+case ${1:-} in version) echo "$AGENT_VERSION"; exit 0;; esac
+CONF=/etc/fs-agent.conf
+if [[ ${1:-} == --conf ]]; then CONF=${2:-}; shift 2; fi
+[[ $CONF =~ ^/etc/fs-agent(-[a-z0-9]+)?\.conf$ && -f $CONF ]] || { echo "fs-agent: invalid config '$CONF'" >&2; exit 2; }
+# Defaults, overridden by the root-owned config file
+FS_DIR=/var/www/freescout
+FS_USER=www-data
+STATE_DIR=/var/lib/fs-agent
+SAFETY_DIR=/var/backups/fs-agent
+SAFETY_KEEP=3
+# Kept on THIS server when another instance's data is restored onto it (see keep_*):
+KEEP_SSO_PATTERN='saml|oauth|sso|ldap|socialite|azure|entra|okta|openid|oidc|adfs'   # module alias/name match
+KEEP_MODULES=""        # extra module aliases to keep, space separated
+KEEP_OPTIONS=""        # extra option-name prefixes to keep, space separated (e.g. "company_name mail_")
+# shellcheck disable=SC1090
+. "$CONF"
+FS_DIR=$(realpath -e "$FS_DIR")
+INSTANCE_TAG=$(basename "$CONF" .conf)
+mkdir -p "$STATE_DIR" "$SAFETY_DIR"; chmod 700 "$STATE_DIR" "$SAFETY_DIR"
+
+die()  { echo "fs-agent: $*" >&2; exit 1; }
+[[ -f $FS_DIR/artisan && -f $FS_DIR/.env ]] || die "FreeScout not found in $FS_DIR"
+
+MYSQL=$(command -v mariadb || command -v mysql || true)
+MYSQLDUMP=$(command -v mariadb-dump || command -v mysqldump || true)
+
+env_get() {   # env_get KEY -> value from FreeScout .env (quotes stripped)
+  local line v
+  line=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$FS_DIR/.env" | tail -n1 || true)
+  v=${line#*=}; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  [[ $v == \"*\" ]] && v=${v:1:-1}; [[ $v == \'*\' ]] && v=${v:1:-1}
+  printf '%s' "$v"
+}
+DB_CONN=$(env_get DB_CONNECTION); DB_NAME=$(env_get DB_DATABASE)
+
+DEFAULTS=""
+cleanup() { [[ -n $DEFAULTS ]] && rm -f "$DEFAULTS"; [[ -n ${TMPDUMP:-} ]] && rm -f "$TMPDUMP"; return 0; }
+trap cleanup EXIT
+db_defaults() {   # temp client option file so the password never shows in ps
+  [[ ${DB_CONN:-mysql} == mysql ]] || die "only MySQL/MariaDB is supported (DB_CONNECTION=$DB_CONN)"
+  [[ -n $MYSQL && -n $MYSQLDUMP ]] || die "mysql/mariadb client tools not found"
+  [[ -n $DEFAULTS ]] && return 0
+  local pw; pw=$(env_get DB_PASSWORD); pw=${pw//\\/\\\\}; pw=${pw//\"/\\\"}
+  DEFAULTS=$(mktemp /run/fs-agent.XXXXXX)
+  {
+    echo "[client]"
+    echo "user=\"$(env_get DB_USERNAME)\""
+    echo "password=\"$pw\""
+    echo "host=$(env_get DB_HOST)"
+    echo "port=$(env_get DB_PORT)"
+    echo "default-character-set=utf8mb4"
+  } >"$DEFAULTS"
+}
+sql() { db_defaults; "$MYSQL" --defaults-extra-file="$DEFAULTS" -N -B "$DB_NAME" -e "$1"; }
+sql_raw() { db_defaults; "$MYSQL" --defaults-extra-file="$DEFAULTS" -N -B -r "$DB_NAME" -e "$1"; }   # no output escaping (values pre-quoted)
+artisan() { (cd "$FS_DIR" && runuser -u "$FS_USER" -- env HOME=/tmp php artisan "$@"); }
+json() {   # json k=v k=v ... -> JSON object (values via PHP for correct escaping)
+  local args=() kv
+  for kv in "$@"; do args+=("${kv%%=*}" "${kv#*=}"); done
+  php -r '$o=[]; for($i=1;$i<$argc;$i+=2){ $v=$argv[$i+1];
+            if($v==="true"||$v==="false") $v=$v==="true"; elseif($v!=="" && preg_match("/^-?\d+$/",$v)) $v=(int)$v; elseif($v==="null") $v=null;
+            $o[$argv[$i]]=$v; } echo json_encode($o, JSON_UNESCAPED_SLASHES), "\n";' -- "${args[@]}"
+}
+fs_version() { grep -oE "'version'[[:space:]]*=>[[:space:]]*'[^']+'" "$FS_DIR/config/app.php" | head -1 | grep -oE "[0-9][0-9.]*[0-9]" || echo unknown; }
+is_standby() { [[ -f $STATE_DIR/$INSTANCE_TAG.standby ]]; }
+is_down()    { [[ -f $FS_DIR/storage/framework/down ]]; }
+
+cmd_info() {
+  db_defaults
+  local dbb files disk
+  dbb=$(sql "SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema=DATABASE();" 2>/dev/null || echo null)
+  files=$(du -sb "$FS_DIR/storage/app" 2>/dev/null | cut -f1 || echo null)
+  disk=$(df -B1 --output=avail "$FS_DIR" | tail -1 | tr -d ' ')
+  json agent_version="$AGENT_VERSION" hostname="$(hostname -f 2>/dev/null || hostname)" install_dir="$FS_DIR" \
+       freescout_version="$(fs_version)" app_url="$(env_get APP_URL)" php_version="$(php -r 'echo PHP_VERSION;')" \
+       db_server="$(sql 'SELECT VERSION();' 2>/dev/null || echo unknown)" db_name="$DB_NAME" db_bytes="$dbb" files_bytes="$files" \
+       disk_free_bytes="$disk" standby="$(is_standby && echo true || echo false)" maintenance="$(is_down && echo true || echo false)" \
+       scheduler_found="$(scheduler_found && echo true || echo false)" os="$(. /etc/os-release && echo "$PRETTY_NAME")"
+}
+
+cmd_stats() {
+  local out=() t c
+  for t in conversations threads customers emails users mailboxes folders attachments; do
+    c=$(sql "SELECT COUNT(*) FROM \`$t\`;" 2>/dev/null || echo null); out+=("$t=$c")
+  done
+  out+=("last_conversation_id=$(sql 'SELECT COALESCE(MAX(id),0) FROM conversations;' 2>/dev/null || echo null)")
+  out+=("last_thread_at=$(sql 'SELECT COALESCE(MAX(created_at),"") FROM threads;' 2>/dev/null || echo '')")
+  json "${out[@]}"
+}
+
+cmd_dump_db() {   # gzip'd consistent dump to stdout
+  db_defaults
+  "$MYSQLDUMP" --defaults-extra-file="$DEFAULTS" --single-transaction --quick --routines --triggers \
+    --no-tablespaces --hex-blob --default-character-set=utf8mb4 "$DB_NAME" | gzip -c
+}
+
+cmd_get_appkey() { local k; k=$(env_get APP_KEY); [[ -n $k ]] || die "APP_KEY not set"; echo "$k"; }
+
+drop_all_tables() {
+  local stmts
+  stmts=$(sql "SELECT CONCAT('DROP ', IF(table_type='VIEW','VIEW','TABLE'), ' IF EXISTS \`', table_name, '\`;') FROM information_schema.tables WHERE table_schema=DATABASE();")
+  db_defaults
+  { echo "SET FOREIGN_KEY_CHECKS=0;"; echo "$stmts"; echo "SET FOREIGN_KEY_CHECKS=1;"; } | "$MYSQL" --defaults-extra-file="$DEFAULTS" "$DB_NAME"
+}
+server_has_uca1400() {   # utf8mb4_uca1400_* collations exist from MariaDB 10.10 (and are 11.x defaults)
+  sql "SET NAMES utf8mb4; SELECT 'a' COLLATE utf8mb4_uca1400_ai_ci;" >/dev/null 2>&1
+}
+sql_compat() {   # make a dump from any MariaDB/MySQL 10.x/11.x importable here
+  # 1) MariaDB >= 10.5.25/10.6.18/11.x put a "sandbox mode" marker on line 1 that older clients reject
+  local filters=(-e '1{/999999.*sandbox/d}')
+  # 2) dumps from MariaDB 11.x can name uca1400 collations that older servers don't have
+  if ! server_has_uca1400; then
+    filters+=(-e 's/utf8mb4_uca1400_[a-z0-9_]*/utf8mb4_unicode_ci/g' -e 's/utf8mb3_uca1400_[a-z0-9_]*/utf8mb3_unicode_ci/g' -e 's/utf8_uca1400_[a-z0-9_]*/utf8_unicode_ci/g')
+  fi
+  sed "${filters[@]}"
+}
+import_gz() { db_defaults; gunzip -c "$1" | sql_compat | "$MYSQL" --defaults-extra-file="$DEFAULTS" "$DB_NAME"; }
+
+# ── settings this server keeps across restores (SSO, module licenses) ─────────
+keep_aliases() {   # aliases of installed SSO modules (+ KEEP_MODULES)
+  local mj alias name out=()
+  for mj in "$FS_DIR"/Modules/*/module.json; do
+    [[ -f $mj ]] || continue
+    alias=$(php -r '$j=json_decode(file_get_contents($argv[1]),true); echo is_array($j)?($j["alias"]??""):"";' -- "$mj")
+    name=$(php -r '$j=json_decode(file_get_contents($argv[1]),true); echo is_array($j)?($j["name"]??""):"";' -- "$mj")
+    [[ $alias =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    if [[ ${alias,,} =~ $KEEP_SSO_PATTERN || ${name,,} =~ $KEEP_SSO_PATTERN || $(basename "$(dirname "$mj")") =~ ($KEEP_SSO_PATTERN) ]]; then out+=("$alias"); fi
+  done
+  for alias in $KEEP_MODULES; do [[ $alias =~ ^[A-Za-z0-9_-]+$ ]] && out+=("$alias"); done
+  printf '%s\n' "${out[@]}" | awk 'NF && !seen[tolower($0)]++'
+}
+keep_option_where() {   # SQL condition matching the option names to keep
+  local conds=() a p e
+  while IFS= read -r a; do
+    [[ -n $a ]] || continue; e=${a//_/\\_}
+    conds+=("name LIKE '${e}.%'" "name LIKE '${e}\\_%'" "name LIKE '%.${e}.%'")
+  done < <(keep_aliases)
+  for p in saml oauth sso socialite ldap; do conds+=("name LIKE '${p}%'"); done
+  for p in $KEEP_OPTIONS; do [[ $p =~ ^[A-Za-z0-9_.-]+$ ]] && conds+=("name LIKE '${p//_/\\_}%'"); done
+  local IFS='|'; local joined="${conds[*]}"; echo "(${joined//|/ OR })"
+}
+keep_tables() {   # tables owned by SSO modules (by name)
+  sql "SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name REGEXP '^($KEEP_SSO_PATTERN)';" 2>/dev/null || true
+}
+KEEP_DIR="$STATE_DIR/$INSTANCE_TAG.keep"   # saved between restore-db and finalize (root only)
+
+# Pure-PHP helper (loads no FreeScout code, so it is safe to run as root). Saves / re-applies kept rows
+# and re-encrypts values encrypted with the old APP_KEY (Laravel encrypt(): AES-256-CBC + HMAC-SHA256).
+keep_php() {   # keep_php export|apply <json> ; env: KP_KEY (+ DB creds, condition, aliases set here)
+  local php rc=0; php=$(mktemp /run/fs-agent-keep.XXXXXX.php)
+  cat >"$php" <<'PHP'
+<?php
+$mode = $argv[1]; $file = $argv[2];
+$key = getenv('KP_KEY'); if (strpos($key, 'base64:') === 0) $key = base64_decode(substr($key, 7));
+if (strlen($key) !== 32) { fwrite(STDERR, "APP_KEY is not a 32-byte AES-256 key\n"); exit(1); }
+$dsn = 'mysql:host=' . getenv('KP_HOST') . ';port=' . (getenv('KP_PORT') ?: 3306) . ';dbname=' . getenv('KP_DB') . ';charset=utf8mb4';
+$db = new PDO($dsn, getenv('KP_USER'), getenv('KP_PASS'), [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$where = getenv('KP_WHERE'); $aliases = array_values(array_filter(explode(',', getenv('KP_ALIASES'))));
+function dec($p, $key) {   // inner (still serialized) plaintext, or null if not encrypted with this key
+  if (!is_string($p) || strlen($p) < 40) return null;
+  $raw = base64_decode($p, true); if ($raw === false) return null;
+  $j = json_decode($raw, true);
+  if (!is_array($j) || !isset($j['iv'], $j['value'], $j['mac'])) return null;
+  if (!hash_equals(hash_hmac('sha256', $j['iv'] . $j['value'], $key), $j['mac'])) return null;
+  $v = openssl_decrypt($j['value'], 'AES-256-CBC', $key, 0, base64_decode($j['iv']));
+  return $v === false ? null : $v;
+}
+function enc($plain, $key) {
+  $iv = random_bytes(16);
+  $value = openssl_encrypt($plain, 'AES-256-CBC', $key, 0, $iv);
+  $iv = base64_encode($iv); $mac = hash_hmac('sha256', $iv . $value, $key);
+  return base64_encode(json_encode(compact('iv', 'value', 'mac')));
+}
+$in = $aliases ? implode(',', array_fill(0, count($aliases), '?')) : "''";
+if ($mode === 'export') {
+  $out = ['options' => [], 'modules' => []]; $nenc = 0;
+  foreach ($db->query("SELECT name, value FROM options WHERE $where") as $r) {
+    $d = dec($r['value'], $key); if ($d !== null) $nenc++;
+    $out['options'][] = ['name' => $r['name'], 'enc' => $d !== null, 'v' => base64_encode($d !== null ? $d : $r['value'])];
+  }
+  if ($aliases) {
+    $st = $db->prepare("SELECT * FROM modules WHERE alias IN ($in)"); $st->execute($aliases);
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+      $lic = $r['license']; $d = $lic !== null ? dec($lic, $key) : null; if ($d !== null) $nenc++;
+      $out['modules'][] = ['row' => $r, 'enc' => $d !== null, 'lic' => $lic === null ? null : base64_encode($d !== null ? $d : $lic)];
+    }
+  }
+  file_put_contents($file, json_encode($out)); chmod($file, 0600);
+  echo count($out['options']), ' ', count($out['modules']), ' ', $nenc, "\n";
+  exit(0);
+}
+// apply: after the restored database was upgraded and the new APP_KEY is in .env
+$data = json_decode(file_get_contents($file), true);
+if (!is_array($data)) { fwrite(STDERR, "saved SSO settings file is unreadable\n"); exit(1); }
+$db->beginTransaction();
+$db->exec("DELETE FROM options WHERE $where");
+$ins = $db->prepare('INSERT INTO options (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)');
+foreach ($data['options'] as $o) { $v = base64_decode($o['v']); $ins->execute([$o['name'], $o['enc'] ? enc($v, $key) : $v]); }
+if ($aliases) {
+  $cols = array_column($db->query('SHOW COLUMNS FROM modules')->fetchAll(PDO::FETCH_ASSOC), 'Field');
+  $st = $db->prepare("DELETE FROM modules WHERE alias IN ($in)"); $st->execute($aliases);
+  foreach ($data['modules'] as $m) {
+    $row = array_intersect_key($m['row'], array_flip($cols)); unset($row['id']);
+    if (array_key_exists('license', $row)) {
+      $l = $m['lic'] === null ? null : base64_decode($m['lic']);
+      $row['license'] = ($m['enc'] && $l !== null) ? enc($l, $key) : $l;
+    }
+    $names = array_keys($row);
+    $db->prepare('INSERT INTO modules (`' . implode('`,`', $names) . '`) VALUES (' . implode(',', array_fill(0, count($names), '?')) . ')')
+       ->execute(array_values($row));
+  }
+}
+$db->commit();
+echo count($data['options']), ' ', count($data['modules']), "\n";
+PHP
+  chmod 600 "$php"
+  KP_HOST=$(env_get DB_HOST) KP_PORT=$(env_get DB_PORT) KP_DB=$DB_NAME KP_USER=$(env_get DB_USERNAME) KP_PASS=$(env_get DB_PASSWORD) \
+    KP_WHERE=$(keep_option_where) KP_ALIASES=$(keep_aliases | paste -sd, -) php "$php" "$@" || rc=$?
+  rm -f "$php"; return $rc
+}
+
+keep_save() {   # before the import: decrypt + save this server's SSO rows and tables
+  rm -rf "$KEEP_DIR"; install -d -m 700 "$KEEP_DIR"
+  local counts t
+  counts=$(KP_KEY=$(env_get APP_KEY) keep_php export "$KEEP_DIR/keep.json") || return 1
+  read -r KEEP_N_OPTIONS _ KEEP_N_ENC <<<"$counts"
+  mapfile -t KEEP_TABLE_LIST < <(keep_tables)
+  : >"$KEEP_DIR/tables.sql"
+  for t in "${KEEP_TABLE_LIST[@]}"; do
+    [[ $t =~ ^[A-Za-z0-9_]+$ ]] || continue
+    "$MYSQLDUMP" --defaults-extra-file="$DEFAULTS" --single-transaction --skip-comments --no-tablespaces --hex-blob "$DB_NAME" "$t" >>"$KEEP_DIR/tables.sql" || return 1
+  done
+  KEEP_SUMMARY_MODULES=$(keep_aliases | paste -sd, -)
+  KEEP_SUMMARY_TABLES=$(IFS=,; echo "${KEEP_TABLE_LIST[*]}")
+  echo "$KEEP_SUMMARY_MODULES" >"$KEEP_DIR/modules"; echo "$KEEP_SUMMARY_TABLES" >"$KEEP_DIR/tables"
+}
+keep_apply() {   # in finalize, after migrations and with the new APP_KEY: put them back
+  [[ -f $KEEP_DIR/keep.json ]] || return 0
+  db_defaults
+  local counts
+  counts=$(KP_KEY=$(env_get APP_KEY) keep_php apply "$KEEP_DIR/keep.json") || return 1
+  if [[ -s $KEEP_DIR/tables.sql ]]; then
+    { echo "SET FOREIGN_KEY_CHECKS=0;"; cat "$KEEP_DIR/tables.sql"; echo "SET FOREIGN_KEY_CHECKS=1;"; } | sql_compat | "$MYSQL" --defaults-extra-file="$DEFAULTS" "$DB_NAME" || return 1
+  fi
+  read -r KEEP_N_OPTIONS _ <<<"$counts"
+  KEEP_SUMMARY_MODULES=$(cat "$KEEP_DIR/modules" 2>/dev/null || true); KEEP_SUMMARY_TABLES=$(cat "$KEEP_DIR/tables" 2>/dev/null || true)
+  rm -rf "$KEEP_DIR"
+  KEEP_APPLIED=true
+}
+
+cmd_restore_db() {   # gzip'd SQL on stdin; takes a safety dump first, rolls back on failure
+  local keep=false; [[ ${1:-} == --keep-sso ]] && keep=true
+  db_defaults
+  rm -rf "$KEEP_DIR"   # never re-apply something saved for an earlier run
+  TMPDUMP=$(mktemp /var/tmp/fs-agent-restore.XXXXXX)
+  cat >"$TMPDUMP"
+  gzip -t "$TMPDUMP" 2>/dev/null || die "received dump is not valid gzip (transfer interrupted?)"
+  [[ $(gunzip -c "$TMPDUMP" | head -c 200000 | grep -c 'CREATE TABLE') -gt 0 ]] || die "received dump contains no tables"
+  local safety; safety="$SAFETY_DIR/$INSTANCE_TAG-pre-restore-$(date +%Y%m%d-%H%M%S).sql.gz"
+  cmd_dump_db >"$safety" || die "could not take safety dump of current database"
+  echo "safety dump: $safety" >&2
+  # keep only the newest SAFETY_KEEP safety dumps
+  find "$SAFETY_DIR" -maxdepth 1 -name "$INSTANCE_TAG-pre-restore-*.sql.gz" -printf '%T@ %p\n' | sort -rn | tail -n +$((SAFETY_KEEP+1)) | cut -d' ' -f2- | xargs -r rm -f
+  if $keep; then
+    keep_save || { rm -rf "$KEEP_DIR"; die "could not save this server's SSO settings - nothing was changed"; }
+    echo "saved this server's SSO setup: $KEEP_N_OPTIONS settings ($KEEP_N_ENC encrypted values), modules: ${KEEP_SUMMARY_MODULES:-none}, tables: ${KEEP_SUMMARY_TABLES:-none} - re-applied after the database upgrade (finalize)" >&2
+  fi
+  drop_all_tables
+  if ! import_gz "$TMPDUMP"; then
+    echo "fs-agent: import failed - rolling back to safety dump" >&2
+    rm -rf "$KEEP_DIR"
+    drop_all_tables; import_gz "$safety" || die "ROLLBACK FAILED - restore manually from $safety"
+    die "import failed; previous database restored from $safety"
+  fi
+  if $keep; then
+    json restored=true safety_dump="$safety" kept_sso=true kept_options="$KEEP_N_OPTIONS" kept_encrypted="$KEEP_N_ENC" kept_modules="$KEEP_SUMMARY_MODULES" kept_tables="$KEEP_SUMMARY_TABLES"
+    return
+  fi
+  json restored=true safety_dump="$safety" kept_sso=false
+}
+
+cmd_modules() {   # installed modules (Modules/*/module.json) as JSON
+  php -r '$o = [];
+    foreach (glob($argv[1]."/Modules/*/module.json") ?: [] as $f) {
+      $j = json_decode(file_get_contents($f), true); if (!is_array($j)) continue;
+      $o[] = ["dir" => basename(dirname($f)), "alias" => $j["alias"] ?? "", "name" => $j["name"] ?? "", "version" => (string)($j["version"] ?? "")];
+    }
+    echo json_encode($o, JSON_UNESCAPED_SLASHES), "\n";' -- "$FS_DIR"
+}
+
+cmd_rsync() {   # validated rsync server, confined to the FreeScout directory
+  [[ ${1:-} == --server ]] || die "rsync: only server mode allowed"
+  local a bundle
+  for a in "$@"; do
+    case $a in
+      --server|--sender|--delete|--delete-after|--delete-during|--delete-delay|--numeric-ids|--partial|--safe-links|--ignore-errors|--force|--stats|--info=*|--debug=*|--checksum|--compress|--zl=*|--compress-choice=*|--checksum-choice=*) ;;
+      -[A-Za-z0-9.]*)
+        bundle=${a%%e.*}   # chars before the 'e.' capability block
+        [[ $bundle == *s* ]] && die "rsync: secluded/protected args not allowed"
+        [[ $a =~ ^-[A-Za-z0-9.]+$ ]] || die "rsync: bad option '$a'" ;;
+      --*) die "rsync: option '$a' not allowed" ;;
+      .) ;;
+      *)
+        local p; p=$(realpath -m -- "$a")
+        [[ $p == "$FS_DIR" || $p == "$FS_DIR"/* ]] || die "rsync: path '$a' is outside $FS_DIR" ;;
+    esac
+  done
+  exec rsync "$@"
+}
+
+cmd_maintenance() {
+  case ${1:-} in
+    on)  artisan down >/dev/null 2>&1 || { mkdir -p "$FS_DIR/storage/framework"; echo "{\"time\":$(date +%s),\"message\":null,\"retry\":null,\"allowed\":[]}" >"$FS_DIR/storage/framework/down"; } ;;
+    off) artisan up >/dev/null 2>&1 || rm -f "$FS_DIR/storage/framework/down" ;;
+    *) die "usage: maintenance on|off" ;;
+  esac
+  json maintenance="$(is_down && echo true || echo false)"
+}
+
+cron_rewrite() {   # cron_rewrite on|off <file>: (un)comment only THIS install's schedule:run line
+  local tag='#FSAGENT-STANDBY# ' pat="$FS_DIR/artisan schedule:run"
+  awk -v p="$pat" -v tag="$tag" -v mode="$1" '{
+      if (index($0, p)) {
+        if (mode == "off" && index($0, tag) != 1) $0 = tag $0
+        if (mode == "on"  && index($0, tag) == 1) $0 = substr($0, length(tag) + 1)
+      }
+      print }' "$2"
+}
+scheduler_found() {
+  grep -qsF "$FS_DIR/artisan schedule:run" /etc/cron.d/* /etc/crontab 2>/dev/null && return 0
+  crontab -u "$FS_USER" -l 2>/dev/null | grep -qF "$FS_DIR/artisan schedule:run"
+}
+set_cron() {   # set_cron on|off
+  local f tmp
+  for f in /etc/cron.d/* /etc/crontab; do
+    [[ -f $f ]] && grep -qF "$FS_DIR/artisan schedule:run" "$f" || continue
+    tmp=$(mktemp); cron_rewrite "$1" "$f" >"$tmp"; cat "$tmp" >"$f"; rm -f "$tmp"
+  done
+  if crontab -u "$FS_USER" -l 2>/dev/null | grep -qF "$FS_DIR/artisan schedule:run"; then
+    tmp=$(mktemp); crontab -u "$FS_USER" -l >"$tmp.in"
+    cron_rewrite "$1" "$tmp.in" >"$tmp"; crontab -u "$FS_USER" "$tmp"; rm -f "$tmp" "$tmp.in"
+  fi
+}
+
+cmd_mode() {
+  case ${1:-} in
+    standby)   # no fetching/sending: stop the scheduler and its queue workers
+      set_cron off; touch "$STATE_DIR/$INSTANCE_TAG.standby"
+      # workers are started as 'php artisan ...' from inside FS_DIR, so match on cwd
+      local pid
+      for pid in $(pgrep -u "$FS_USER" -f 'artisan' || true); do
+        if [[ $(readlink "/proc/$pid/cwd" 2>/dev/null) == "$FS_DIR" ]] || tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "$FS_DIR/artisan"; then
+          kill "$pid" 2>/dev/null || true
+        fi
+      done ;;
+    active)
+      set_cron on; rm -f "$STATE_DIR/$INSTANCE_TAG.standby" ;;
+    *) die "usage: mode standby|active" ;;
+  esac
+  json standby="$(is_standby && echo true || echo false)"
+}
+
+cmd_finalize() {   # APP_KEY of the source on stdin; makes the copied app run here
+  local key; IFS= read -r key || true
+  [[ $key =~ ^base64:[A-Za-z0-9+/=]{40,}$ ]] || die "finalize: invalid APP_KEY on stdin"
+  if grep -qE '^APP_KEY=' "$FS_DIR/.env"; then
+    local esc=${key//\//\\/}; esc=${esc//&/\\&}
+    sed -i "s/^APP_KEY=.*/APP_KEY=$esc/" "$FS_DIR/.env"
+  else echo "APP_KEY=$key" >>"$FS_DIR/.env"; fi
+  mkdir -p "$FS_DIR"/storage/framework/{cache/data,sessions,views} "$FS_DIR"/storage/logs "$FS_DIR"/bootstrap/cache
+  rm -f "$FS_DIR"/bootstrap/cache/*.php "$FS_DIR"/public/js/builds/*.js
+  rm -f "$FS_DIR/public/storage"
+  chown -R "$FS_USER:$FS_USER" "$FS_DIR"
+  artisan storage:link >/dev/null 2>&1 || ln -s "$FS_DIR/storage/app/public" "$FS_DIR/public/storage"
+  # Bring the copied database up to THIS server's FreeScout version (no-op when versions match)
+  artisan migrate --force >&2 || die "finalize: database migration failed"
+  artisan freescout:after-app-update >&2 || echo "fs-agent: after-app-update reported a problem (continuing)" >&2
+  # Each module: run its migrations and re-create public/modules/<alias> (paths differ between servers)
+  local mj alias
+  for mj in "$FS_DIR"/Modules/*/module.json; do
+    [[ -f $mj ]] || continue
+    alias=$(php -r '$j=json_decode(file_get_contents($argv[1]),true); echo is_array($j)?($j["alias"]??""):"";' -- "$mj")
+    [[ $alias =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    artisan freescout:module-install "$alias" >&2 || echo "fs-agent: module $alias install step failed" >&2
+  done
+  KEEP_APPLIED=false
+  if [[ -f $KEEP_DIR/keep.json ]]; then
+    keep_apply || die "finalize: could not re-apply this server's saved SSO settings (still saved in $KEEP_DIR; re-run the job)"
+    echo "re-applied this server's SSO setup: $KEEP_N_OPTIONS settings, module rows: ${KEEP_SUMMARY_MODULES:-none} (encrypted values re-encrypted for the new APP_KEY)" >&2
+  fi
+  artisan freescout:clear-cache >&2 || true
+  chown -R "$FS_USER:$FS_USER" "$FS_DIR"
+  json finalized=true freescout_version="$(fs_version)" sso_reapplied="$KEEP_APPLIED" sso_options="${KEEP_N_OPTIONS:-0}"
+}
+
+cmd_health() {
+  local url host scheme code
+  url=$(env_get APP_URL); host=${url#*://}; host=${host%%/*}; scheme=${url%%://*}
+  [[ $scheme == https ]] || scheme=http
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 --resolve "$host:$([[ $scheme == https ]] && echo 443 || echo 80):127.0.0.1" "$scheme://$host/login" 2>/dev/null || true)
+  json url="$scheme://$host/login" http_code="${code:-0}" ok="$([[ $code == 200 || $code == 302 ]] && echo true || echo false)"
+}
+
+sub=${1:-}; shift || true
+case $sub in
+  ping)        echo pong ;;
+  version)     echo "$AGENT_VERSION" ;;
+  info)        cmd_info ;;
+  stats)       cmd_stats ;;
+  dump-db)     cmd_dump_db ;;
+  get-appkey)  cmd_get_appkey ;;
+  restore-db)  cmd_restore_db "$@" ;;
+  sso-keep-preview) db_defaults
+    echo "modules: $(keep_aliases | paste -sd, -)"
+    echo "options kept: $(sql "SELECT IFNULL(GROUP_CONCAT(name SEPARATOR ', '),'(none)') FROM options WHERE $(keep_option_where);")"
+    echo "tables kept: $(keep_tables | paste -sd, -)"
+    echo "other option names mentioning SSO words (NOT kept - add a prefix to KEEP_OPTIONS in $CONF if one belongs to SSO):"
+    sql "SELECT IFNULL(GROUP_CONCAT(name SEPARATOR ', '),'(none)') FROM options WHERE NOT $(keep_option_where) AND name REGEXP '$KEEP_SSO_PATTERN';" ;;
+  rsync)       cmd_rsync "$@" ;;
+  maintenance) cmd_maintenance "$@" ;;
+  mode)        cmd_mode "$@" ;;
+  finalize)    cmd_finalize ;;
+  health)      cmd_health ;;
+  modules)     cmd_modules ;;
+  *)           die "unknown command '$sub'" ;;
+esac

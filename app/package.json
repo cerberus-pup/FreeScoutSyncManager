@@ -1,0 +1,22 @@
+{
+  "name": "freescout-sync-manager",
+  "version": "1.0.0",
+  "description": "Backup, sync and migrate FreeScout instances over SSH",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node --disable-warning=ExperimentalWarning dist/server.js",
+    "set-password": "node --disable-warning=ExperimentalWarning dist/cli.js set-password"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}
